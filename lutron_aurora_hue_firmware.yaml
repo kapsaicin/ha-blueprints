@@ -1,0 +1,225 @@
+blueprint:
+  name: Lutron Aurora (Hue-protocol firmware) - light dimmer
+  description: >
+    Control a light with a Lutron Aurora Z3-1BRL paired to ZHA, using the
+    quirk from zigpy/zha-device-handlers#5330 (firmware 0x00000c12 and other
+    builds that report on the Philips 0xFC00 cluster).
+
+
+    - **Press:** toggle the light (or run your own action).
+
+    - **Dial:** relative brightness. Turning down to 0% switches the light off,
+    and turning up from off switches it on. For accurate dimming on fast turns,
+    pick a dial-target helper (see that input).
+
+    - **Double press / long press:** optional actions of your own (the long
+    press action runs once, when you let go).
+
+
+    Single presses fire about 0.3 s after release, because the remote waits to
+    see whether it's a double press.
+  domain: automation
+  source_url: https://github.com/kapsaicin/ha-blueprints/blob/main/lutron_aurora_hue_firmware.yaml
+  input:
+    remote:
+      name: Aurora
+      description: The Lutron Aurora (Z3-1BRL) paired in ZHA.
+      selector:
+        device:
+          filter:
+            - integration: zha
+              model: Z3-1BRL
+    light:
+      name: Light
+      description: Light (or light group) to toggle and dim.
+      selector:
+        entity:
+          filter:
+            - domain: light
+    full_turn_pct:
+      name: Brightness per full turn
+      description: >
+        Brightness change for one full turn of the dial. The Aurora reports
+        about 1000 rotation units per turn.
+      default: 100
+      selector:
+        number:
+          min: 25
+          max: 300
+          step: 5
+          unit_of_measurement: "%"
+    max_step_pct:
+      name: Largest step per dial report
+      description: Caps a single fast flick so it can't jump straight to 0% or 100%.
+      default: 25
+      selector:
+        number:
+          min: 5
+          max: 100
+          step: 5
+          unit_of_measurement: "%"
+    transition:
+      name: Dial transition
+      default: 0.3
+      selector:
+        number:
+          min: 0
+          max: 2
+          step: 0.1
+          unit_of_measurement: s
+    dial_target:
+      name: Dial target helper (optional, recommended)
+      description: >
+        An input_number helper with min 0, max 100 and step 1, one per Aurora.
+        Without it, each dial report steps from the brightness the light last
+        reported. Many lights and groups report late, so on a fast turn steps
+        overlap and get lost. With it, the blueprint keeps the target
+        brightness in the helper, which updates instantly. It resyncs from the
+        light at the start of each turn.
+      default:
+      selector:
+        entity:
+          filter:
+            - domain: input_number
+    press_action:
+      name: Press action
+      description: Leave empty to toggle the light.
+      default: []
+      selector:
+        action: {}
+    double_press_action:
+      name: Double press action
+      default: []
+      selector:
+        action: {}
+    hold_action:
+      name: Long press action
+      description: >
+        Runs once when you let go after a long press (knob_long_release).
+        While the knob is held the Aurora repeats knob_hold about every
+        0.8 s, so this deliberately does not use knob_hold. A firm, slow
+        press often counts as a long press, so you may want this to toggle
+        too.
+      default: []
+      selector:
+        action: {}
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+variables:
+  light_entity: !input light
+  full_turn_pct: !input full_turn_pct
+  max_step_pct: !input max_step_pct
+  dial_transition: !input transition
+  press_action: !input press_action
+  dial_target: !input dial_target
+
+triggers:
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_id: !input remote
+      command: knob_press
+    id: press
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_id: !input remote
+      command: knob_double_press
+    id: double_press
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_id: !input remote
+      command: knob_long_release
+    id: hold
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_id: !input remote
+      command: dial_rotate_cw
+    id: dial
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_id: !input remote
+      command: dial_rotate_ccw
+    id: dial
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: press
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ press_action | length > 0 }}"
+            then: !input press_action
+            else:
+              - action: light.toggle
+                target:
+                  entity_id: !input light
+      - conditions:
+          - condition: trigger
+            id: double_press
+        sequence: !input double_press_action
+      - conditions:
+          - condition: trigger
+            id: hold
+        sequence: !input hold_action
+      - conditions:
+          - condition: trigger
+            id: dial
+        sequence:
+          - variables:
+              step: >-
+                {% set r = trigger.event.data.args.rotation | int(0) %}
+                {% set s = (r * full_turn_pct / 1000) | round(0) | int %}
+                {{ [[s, 0 - max_step_pct | int] | max, max_step_pct | int] | min }}
+          - condition: template
+            value_template: "{{ step | int != 0 }}"
+          - if:
+              - condition: template
+                value_template: "{{ dial_target is string and dial_target.startswith('input_number.') }}"
+            then:
+              - variables:
+                  current_pct: >-
+                    {{ ((state_attr(light_entity, 'brightness') | int(0)) / 2.55) | round(0) | int
+                       if is_state(light_entity, 'on') else 0 }}
+                  resync: >-
+                    {{ trigger.event.data.args.phase | default('') == 'start'
+                       or states(dial_target) in ['unknown', 'unavailable']
+                       or (now() - states[dial_target].last_updated).total_seconds() > 3 }}
+                  base: "{{ current_pct if resync else states(dial_target) | float(current_pct) }}"
+                  target: "{{ [[(base | float + step | int) | round(0) | int, 0] | max, 100] | min }}"
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ dial_target }}"
+                data:
+                  value: "{{ target }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ target | int == 0 }}"
+                then:
+                  - action: light.turn_off
+                    target:
+                      entity_id: !input light
+                    data:
+                      transition: "{{ dial_transition }}"
+                else:
+                  - action: light.turn_on
+                    target:
+                      entity_id: !input light
+                    data:
+                      brightness_pct: "{{ target }}"
+                      transition: "{{ dial_transition }}"
+            else:
+              - action: light.turn_on
+                target:
+                  entity_id: !input light
+                data:
+                  brightness_step_pct: "{{ step }}"
+                  transition: "{{ dial_transition }}"

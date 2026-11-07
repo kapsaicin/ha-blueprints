@@ -1,0 +1,143 @@
+blueprint:
+  name: Winter window condensation alert
+  description: >
+    Warns you once a day when it's cold outside and indoor humidity is high
+    enough to fog or frost windows (and the gap behind storm windows).
+
+
+    It fires when the outdoor temperature has been below your threshold for 30
+    minutes **and** any of your indoor humidity sensors is above its threshold.
+    The notification lists every room over the limit, worst first.
+
+
+    Healthy winter indoor humidity is roughly 30–45%. At 55–60% indoors and the
+    20s °F (below about −3 °C) outside, single-pane glass and storm windows
+    start to fog.
+
+
+    Notifications only go out inside the time window you choose. A daily
+    catch-up check covers conditions that started overnight.
+  domain: automation
+  author: kapsaicin
+  source_url: https://github.com/kapsaicin/ha-blueprints/blob/main/winter_condensation_alert.yaml
+  input:
+    outdoor_temperature:
+      name: Outdoor temperature sensor
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: temperature
+    outdoor_threshold:
+      name: Cold outside below
+      description: >
+        In your outdoor sensor's unit. Default 25 is for °F; use about −4 for °C.
+      default: 25
+      selector:
+        number:
+          min: -40
+          max: 50
+          step: 1
+          mode: box
+    humidity_sensors:
+      name: Indoor humidity sensors
+      description: One or more per room. The message names each room by its area (the highest reading if a room has several sensors), falling back to the sensor name.
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: sensor
+              device_class: humidity
+    humidity_threshold:
+      name: Humidity too high above
+      default: 50
+      selector:
+        number:
+          min: 30
+          max: 80
+          step: 1
+          unit_of_measurement: "%"
+    notify_device:
+      name: Phone to notify
+      description: A device running the Home Assistant Companion app.
+      selector:
+        device:
+          filter:
+            - integration: mobile_app
+    window_start:
+      name: Don't notify before
+      default: "07:00:00"
+      selector:
+        time: {}
+    window_end:
+      name: Don't notify after
+      default: "22:00:00"
+      selector:
+        time: {}
+    catch_up_time:
+      name: Daily catch-up check
+      description: Re-checks once a day, for conditions that began outside the time window. Pick a time inside the window.
+      default: "07:30:00"
+      selector:
+        time: {}
+
+mode: single
+
+variables:
+  outdoor_temperature: !input outdoor_temperature
+  humidity_sensors: !input humidity_sensors
+  humidity_threshold: !input humidity_threshold
+
+triggers:
+  - trigger: numeric_state
+    entity_id: !input outdoor_temperature
+    below: !input outdoor_threshold
+    for:
+      minutes: 30
+  - trigger: numeric_state
+    entity_id: !input humidity_sensors
+    above: !input humidity_threshold
+    for:
+      minutes: 30
+  - trigger: time
+    at: !input catch_up_time
+
+conditions:
+  - condition: numeric_state
+    entity_id: !input outdoor_temperature
+    below: !input outdoor_threshold
+  - condition: time
+    after: !input window_start
+    before: !input window_end
+  - condition: template
+    value_template: >-
+      {{ humidity_sensors | select('has_value') | map('states') | map('float', 0)
+         | select('gt', humidity_threshold | float) | list | count > 0 }}
+  - condition: template
+    alias: Once a day
+    value_template: >-
+      {{ this.attributes.last_triggered is none
+         or (now() - this.attributes.last_triggered).total_seconds() > 20 * 3600 }}
+
+actions:
+  - variables:
+      rooms: >-
+        {% set ns = namespace(l=[]) %}
+        {% for e in humidity_sensors if has_value(e) and states(e) | float(0) > humidity_threshold | float %}
+          {% set ns.l = ns.l + [(states(e) | float, area_name(e) or state_attr(e, 'friendly_name') or e)] %}
+        {% endfor %}
+        {% set out = namespace(s=[], seen=[]) %}
+        {% for rh, name in ns.l | sort(reverse=true) if name not in out.seen %}
+          {% set out.s = out.s + [name ~ ' ' ~ (rh | round(0) | int) ~ '%'] %}
+          {% set out.seen = out.seen + [name] %}
+        {% endfor %}
+        {{ out.s | join(', ') }}
+      outside: "{{ states(outdoor_temperature) | float(0) | round(0) | int }}{{ state_attr(outdoor_temperature, 'unit_of_measurement') or '' }}"
+  - domain: mobile_app
+    type: notify
+    device_id: !input notify_device
+    title: "💧 Window condensation risk"
+    message: >-
+      {{ outside }} outside and indoor humidity is high: {{ rooms }}.
+      Aim for 30–45% in winter: run bath and kitchen fans longer, and check
+      windows for fog or frost.
