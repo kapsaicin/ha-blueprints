@@ -1,0 +1,143 @@
+blueprint:
+  name: Window-aware blind closing
+  description: >
+    Closes a blind in the evening, but stops part-way if a window in that room
+    is open, so the blind doesn't bang against the frame in the wind and you
+    keep the airflow. Once all the windows are shut, it finishes closing.
+
+
+    - **Evening:** at sunset (plus your offset) the blind closes fully. If any
+    window is open, it moves to the "vent" position instead.
+
+    - **Windows shut later:** if the blind is sitting at the vent position
+    after sunset and every window is now closed, it finishes closing.
+
+    - **Morning (optional):** opens the blind at sunrise (plus your offset).
+
+
+    Window sensors that are unavailable count as closed, so a dead battery
+    never stops the blind from closing. Running the automation by hand (Run
+    actions) does a window-aware close right away.
+  domain: automation
+  author: kapsaicin
+  source_url: https://github.com/kapsaicin/ha-blueprints/blob/main/window_aware_blind_close.yaml
+  input:
+    blind:
+      name: Blind
+      selector:
+        entity:
+          filter:
+            - domain: cover
+    windows:
+      name: Window sensors in this room
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: binary_sensor
+              device_class:
+                - window
+                - opening
+                - door
+    vent_position:
+      name: Vent position
+      description: >
+        Where to stop when a window is open, as a cover position (0 = closed,
+        100 = open). 60 means 40% closed.
+      default: 60
+      selector:
+        number:
+          min: 5
+          max: 95
+          step: 5
+          unit_of_measurement: "%"
+    close_offset:
+      name: Close time relative to sunset
+      default: "00:00:00"
+      selector:
+        duration:
+          allow_negative: true
+    open_in_morning:
+      name: Open in the morning
+      default: false
+      selector:
+        boolean: {}
+    open_offset:
+      name: Open time relative to sunrise
+      default: "00:30:00"
+      selector:
+        duration:
+          allow_negative: true
+
+mode: queued
+max: 5
+
+variables:
+  blind: !input blind
+  windows: !input windows
+  vent_position: !input vent_position
+  open_in_morning: !input open_in_morning
+  any_open: "{{ windows | select('is_state', 'on') | list | count > 0 }}"
+  position: "{{ state_attr(blind, 'current_position') | int(100) }}"
+
+triggers:
+  - trigger: sun
+    event: sunset
+    offset: !input close_offset
+    id: close
+  - trigger: state
+    entity_id: !input windows
+    from: "on"
+    to: "off"
+    id: window_shut
+  - trigger: sun
+    event: sunrise
+    offset: !input open_offset
+    id: open
+
+actions:
+  - choose:
+      - alias: Evening close (or Run actions by hand)
+        conditions:
+          - condition: template
+            value_template: "{{ trigger is not defined or trigger.id | default('close') == 'close' }}"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ any_open }}"
+            then:
+              - condition: template
+                value_template: "{{ position > vent_position | int }}"
+              - action: cover.set_cover_position
+                target:
+                  entity_id: !input blind
+                data:
+                  position: "{{ vent_position | int }}"
+            else:
+              - action: cover.close_cover
+                target:
+                  entity_id: !input blind
+      - alias: All windows now shut, finish closing
+        conditions:
+          - condition: trigger
+            id: window_shut
+          - condition: state
+            entity_id: sun.sun
+            state: below_horizon
+          - condition: template
+            value_template: >-
+              {{ not any_open and (position - vent_position | int) | abs <= 6 }}
+        sequence:
+          - action: cover.close_cover
+            target:
+              entity_id: !input blind
+      - alias: Morning open
+        conditions:
+          - condition: trigger
+            id: open
+          - condition: template
+            value_template: "{{ open_in_morning }}"
+        sequence:
+          - action: cover.open_cover
+            target:
+              entity_id: !input blind
